@@ -33,34 +33,48 @@ jobs:
           sudo apt-get install -y python3-pip python3-mako ninja-build bison flex pkg-config
           pip install --user meson
 
-      - name: Fetch prebuilt bionic deps from Termux repo
+      - name: Fetch bionic deps via sandboxed apt (main + x11-repo)
         run: |
           set -e
-          mkdir -p sysroot
-          BASE=https://packages.termux.dev/apt/termux-main
-          curl -fsSL "$BASE/dists/stable/main/binary-aarch64/Packages.gz" -o Packages.gz
-          gunzip -f Packages.gz
+          APTROOT="$PWD/aptroot"
+          SYSROOT="$PWD/sysroot"
+          mkdir -p "$APTROOT/lists" "$APTROOT/archives/partial" "$SYSROOT"
+          : > "$APTROOT/status"
 
-          # Packages needed for the x11/dri build of zink. If linking fails
-          # later complaining about an unresolved symbol/lib, it's probably
-          # missing from this list — add it and re-run.
-          PKGS="libandroid-shmem libdrm libx11 libxcb libxau libxdmcp libxext libxfixes libxshmfence libxxf86vm xorgproto zstd"
+          cat > "$APTROOT/sources.list" <<EOF
+          deb https://packages.termux.dev/apt/termux-main stable main
+          deb https://packages.termux.dev/apt/termux-x11 x11 main
+          EOF
 
-          for pkg in $PKGS; do
-            fname=$(awk -v p="$pkg" '
-              $1=="Package:" {name=$2}
-              $1=="Filename:" && name==p {print $2; exit}
-            ' Packages)
-            if [ -z "$fname" ]; then
-              echo "WARNING: could not find $pkg in Termux repo index, skipping"
-              continue
-            fi
-            echo "Fetching $pkg -> $fname"
-            curl -fsSL "$BASE/$fname" -o "$pkg.deb"
-            dpkg-deb -x "$pkg.deb" sysroot
+          APT_OPTS=(
+            -o Dir::State::status="$APTROOT/status"
+            -o Dir::Etc::SourceList="$APTROOT/sources.list"
+            -o Dir::Etc::SourceParts=/dev/null
+            -o Dir::Cache="$APTROOT"
+            -o Dir::State::Lists="$APTROOT/lists"
+            -o APT::Architecture=aarch64
+            -o APT::Architectures::=aarch64
+            -o Acquire::Languages=none
+          )
+
+          apt-get "${APT_OPTS[@]}" update
+
+          # Top-level packages only — apt resolves libxcb/libxau/libxdmcp/
+          # libxext/etc transitively, so we don't hand-maintain that list.
+          apt-get "${APT_OPTS[@]}" --download-only -y install \
+            libandroid-shmem libdrm libx11 libxfixes libxshmfence \
+            libxxf86vm libpixman libjpeg-turbo libxdamage libxinerama \
+            libxfont2 libxkbfile libpciaccess xcb-util-renderutil \
+            xcb-util-image xcb-util-keysyms xcb-util-wm xorg-xrandr \
+            xorg-xkbcomp xkeyboard-config xorg-font-util xorg-util-macros \
+            xorgproto zstd
+
+          for deb in "$APTROOT"/archives/*.deb; do
+            echo "Extracting $(basename "$deb")"
+            dpkg-deb -x "$deb" "$SYSROOT"
           done
 
-          find sysroot -maxdepth 6 -type d | head -n 40
+          find "$SYSROOT" -maxdepth 6 -type d | head -n 40
 
       - name: Clone Mesa
         run: |
@@ -85,48 +99,4 @@ jobs:
           c_args = ['-I$SYSROOT_EXTRA/include']
           cpp_args = ['-I$SYSROOT_EXTRA/include']
           c_link_args = ['-L$SYSROOT_EXTRA/lib', '-Wl,-rpath-link,$SYSROOT_EXTRA/lib']
-          cpp_link_args = ['-L$SYSROOT_EXTRA/lib', '-Wl,-rpath-link,$SYSROOT_EXTRA/lib']
-
-          [host_machine]
-          system = 'android'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-
-          [properties]
-          needs_exe_wrapper = true
-          EOF
-
-          echo "PKG_CONFIG_PATH=$SYSROOT_EXTRA/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_SYSROOT_DIR=$PWD/sysroot" >> "$GITHUB_ENV"
-
-      - name: Configure
-        working-directory: mesa
-        env:
-          LDFLAGS: '-landroid-shmem -llog'
-        run: |
-          meson setup build \
-            --cross-file ../cross.ini \
-            -Dplatforms=x11 \
-            -Dglx=dri \
-            -Dgallium-drivers=${{ inputs.gallium_drivers }} \
-            -Dvulkan-drivers= \
-            -Dllvm=disabled \
-            -Dbuildtype=release \
-            -Dstrip=true
-
-      - name: Build
-        working-directory: mesa
-        run: ninja -C build
-
-      - name: Collect driver .so
-        run: |
-          mkdir -p out
-          find mesa/build -name '*_dri.so' -exec cp -v {} out/ \;
-          ls -la out/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: zink-mesa-${{ inputs.mesa_version }}-bionic-aarch64
-          path: out/
+          cpp_link_args = ['-L$SYSROOT
