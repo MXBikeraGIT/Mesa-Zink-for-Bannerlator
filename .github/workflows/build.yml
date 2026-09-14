@@ -1,80 +1,133 @@
-name: Build Mesa 25.2 Zink (bionic aarch64 / Mali G52 MC2)
-
-# Builds Mesa's zink Gallium driver against Termux's bionic toolchain by
-# piggybacking on termux-packages' own build system (which already has the
-# full bionic dependency chain — libdrm, libx11, llvm, wayland, etc. — solved).
-# Output is a raw zink_dri.so you can import into Bannerlator's Wrapper
-# Version Manager (or hand-pack into a .tzst yourself).
+name: Build Mesa 25.2 Zink (bionic aarch64, plain meson+NDK)
 
 on:
   workflow_dispatch:
     inputs:
       mesa_version:
-        description: 'Exact Mesa release version to build (must exist at archive.mesa3d.org)'
+        description: 'Mesa release version (must exist at archive.mesa3d.org)'
         required: false
         default: '25.2.0'
       gallium_drivers:
-        description: 'Comma-separated gallium drivers to build (keep it minimal for faster CI)'
+        description: 'Gallium drivers to build'
         required: false
-        default: 'zink,swrast'
+        default: 'zink,softpipe'
+      api_level:
+        description: 'Android API level to target'
+        required: false
+        default: '28'
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout termux-packages
-        uses: actions/checkout@v4
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
         with:
-          repository: termux/termux-packages
-          fetch-depth: 1
+          ndk-version: r27c
+          add-to-path: true
 
-      - name: Pin mesa build.sh to requested version
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-mako ninja-build bison flex pkg-config
+          pip install --user meson
+
+      - name: Fetch prebuilt bionic deps from Termux repo
         run: |
           set -e
-          MESA_VERSION="${{ inputs.mesa_version }}"
-          URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+          mkdir -p sysroot
+          BASE=https://packages.termux.dev/apt/termux-main
+          curl -fsSL "$BASE/dists/stable/main/binary-aarch64/Packages.gz" -o Packages.gz
+          gunzip -f Packages.gz
 
-          echo "Fetching ${URL} to compute checksum..."
-          curl -fL -o mesa.tar.xz "$URL"
-          SHA256=$(sha256sum mesa.tar.xz | cut -d' ' -f1)
-          echo "SHA256=${SHA256}"
+          # Packages needed for the x11/dri build of zink. If linking fails
+          # later complaining about an unresolved symbol/lib, it's probably
+          # missing from this list — add it and re-run.
+          PKGS="libandroid-shmem libdrm libx11 libxcb libxau libxdmcp libxext libxfixes libxshmfence libxxf86vm xorgproto zstd"
 
-          BUILD_SH=packages/mesa/build.sh
+          for pkg in $PKGS; do
+            fname=$(awk -v p="$pkg" '
+              $1=="Package:" {name=$2}
+              $1=="Filename:" && name==p {print $2; exit}
+            ' Packages)
+            if [ -z "$fname" ]; then
+              echo "WARNING: could not find $pkg in Termux repo index, skipping"
+              continue
+            fi
+            echo "Fetching $pkg -> $fname"
+            curl -fsSL "$BASE/$fname" -o "$pkg.deb"
+            dpkg-deb -x "$pkg.deb" sysroot
+          done
 
-          sed -i "s/^TERMUX_PKG_VERSION=.*/TERMUX_PKG_VERSION=\"${MESA_VERSION}\"/" "$BUILD_SH"
-          sed -i "s/^TERMUX_PKG_REVISION=.*/TERMUX_PKG_REVISION=0/" "$BUILD_SH"
-          sed -i "s/^TERMUX_PKG_SHA256=.*/TERMUX_PKG_SHA256=${SHA256}/" "$BUILD_SH"
+          find sysroot -maxdepth 6 -type d | head -n 40
 
-          # Trim gallium-drivers to just what you actually want (faster build).
-          sed -i "s/-Dgallium-drivers=[^\"]*/-Dgallium-drivers=${{ inputs.gallium_drivers }}/" "$BUILD_SH"
-
-          echo "----- resulting header -----"
-          head -n 20 "$BUILD_SH"
-
-      - name: Build mesa for aarch64 via termux-packages Docker builder
+      - name: Clone Mesa
         run: |
-          ./scripts/run-docker.sh ./build-package.sh -a aarch64 -I mesa
+          git clone --depth 1 --branch "mesa-${{ inputs.mesa_version }}" \
+            https://gitlab.freedesktop.org/mesa/mesa.git mesa
 
-      - name: List build output
+      - name: Write meson cross file
         run: |
-          find . -maxdepth 2 -iname '*.deb' -exec ls -la {} \;
+          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          API=${{ inputs.api_level }}
+          SYSROOT_EXTRA="$PWD/sysroot/data/data/com.termux/files/usr"
 
-      - name: Extract driver .so files
+          cat > cross.ini <<EOF
+          [binaries]
+          c = '$NDK_BIN/aarch64-linux-android${API}-clang'
+          cpp = '$NDK_BIN/aarch64-linux-android${API}-clang++'
+          ar = '$NDK_BIN/llvm-ar'
+          strip = '$NDK_BIN/llvm-strip'
+          pkg-config = 'pkg-config'
+
+          [built-in options]
+          c_args = ['-I$SYSROOT_EXTRA/include']
+          cpp_args = ['-I$SYSROOT_EXTRA/include']
+          c_link_args = ['-L$SYSROOT_EXTRA/lib', '-Wl,-rpath-link,$SYSROOT_EXTRA/lib']
+          cpp_link_args = ['-L$SYSROOT_EXTRA/lib', '-Wl,-rpath-link,$SYSROOT_EXTRA/lib']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          EOF
+
+          echo "PKG_CONFIG_PATH=$SYSROOT_EXTRA/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_SYSROOT_DIR=$PWD/sysroot" >> "$GITHUB_ENV"
+
+      - name: Configure
+        working-directory: mesa
+        env:
+          LDFLAGS: '-landroid-shmem -llog'
         run: |
-          set -e
-          mkdir -p extracted out
-          DEB=$(find . -maxdepth 2 -iname 'mesa_*.deb' | head -n1)
-          if [ -z "$DEB" ]; then
-            echo "Could not find built mesa .deb — check the build step logs above."
-            exit 1
-          fi
-          echo "Extracting $DEB"
-          dpkg-deb -x "$DEB" extracted
-          find extracted -iname '*.so*' -path '*dri*' -exec cp -v {} out/ \;
+          meson setup build \
+            --cross-file ../cross.ini \
+            -Dplatforms=x11 \
+            -Dglx=dri \
+            -Ddri3=enabled \
+            -Dgallium-drivers=${{ inputs.gallium_drivers }} \
+            -Dvulkan-drivers= \
+            -Dllvm=disabled \
+            -Dbuildtype=release \
+            -Dstrip=true
+
+      - name: Build
+        working-directory: mesa
+        run: ninja -C build
+
+      - name: Collect driver .so
+        run: |
+          mkdir -p out
+          find mesa/build -name '*_dri.so' -exec cp -v {} out/ \;
           ls -la out/
 
-      - name: Upload driver artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mesa-${{ inputs.mesa_version }}-zink-aarch64-bionic
+          name: zink-mesa-${{ inputs.mesa_version }}-bionic-aarch64
           path: out/
