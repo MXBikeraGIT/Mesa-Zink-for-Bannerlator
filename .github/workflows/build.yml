@@ -109,7 +109,6 @@ jobs:
             --cross-file ../cross.ini \
             -Dplatforms=x11 \
             -Dglx=dri \
-            -Ddri3=enabled \
             -Dgallium-drivers=${{ inputs.gallium_drivers }} \
             -Dvulkan-drivers= \
             -Dllvm=disabled \
