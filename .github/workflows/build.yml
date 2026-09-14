@@ -1,25 +1,63 @@
-name: Build Mesa 25.2 Zink (bionic aarch64, plain meson+NDK)
+name: Build Mesa 25.2 Zink (Android aarch64, plain Meson + NDK)
 
 on:
   workflow_dispatch:
     inputs:
       mesa_version:
-        description: 'Mesa release version (must exist at archive.mesa3d.org)'
+        description: "Mesa release tag, for example 25.2.0"
         required: false
-        default: '25.2.0'
+        default: "25.2.0"
       gallium_drivers:
-        description: 'Gallium drivers to build'
+        description: "Comma-separated Gallium drivers"
         required: false
-        default: 'zink,softpipe'
+        default: "zink,softpipe"
       api_level:
-        description: 'Android API level to target'
+        description: "Android API level to target"
         required: false
-        default: '28'
+        default: "28"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
+      - name: Install host tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            flex \
+            glslang-tools \
+            libclang-dev \
+            libexpat1-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-dri2-0-dev \
+            libxcb-dri3-dev \
+            libxcb-glx0-dev \
+            libxcb-present-dev \
+            libxcb-randr0-dev \
+            libxcb-shm0-dev \
+            libxcb-sync-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxdamage-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxshmfence-dev \
+            libxxf86vm-dev \
+            libzstd-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            python3-mako \
+            python3-pip \
+            python3-setuptools \
+            python3-wheel \
+            zlib1g-dev
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: ndk
@@ -27,76 +65,111 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Install host tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip python3-mako ninja-build bison flex pkg-config
-          pip install --user meson
-
-      - name: Fetch bionic deps via sandboxed apt (main + x11-repo)
-        run: |
-          set -e
-          APTROOT="$PWD/aptroot"
-          SYSROOT="$PWD/sysroot"
-          mkdir -p "$APTROOT/lists" "$APTROOT/archives/partial" "$SYSROOT"
-          : > "$APTROOT/status"
-
-          cat > "$APTROOT/sources.list" <<EOF
-          deb https://packages.termux.dev/apt/termux-main stable main
-          deb https://packages.termux.dev/apt/termux-x11 x11 main
-          EOF
-
-          APT_OPTS=(
-            -o Dir::State::status="$APTROOT/status"
-            -o Dir::Etc::SourceList="$APTROOT/sources.list"
-            -o Dir::Etc::SourceParts=/dev/null
-            -o Dir::Cache="$APTROOT"
-            -o Dir::State::Lists="$APTROOT/lists"
-            -o APT::Architecture=aarch64
-            -o APT::Architectures::=aarch64
-            -o Acquire::Languages=none
-          )
-
-          apt-get "${APT_OPTS[@]}" update
-
-          # Top-level packages only — apt resolves libxcb/libxau/libxdmcp/
-          # libxext/etc transitively, so we don't hand-maintain that list.
-          apt-get "${APT_OPTS[@]}" --download-only -y install \
-            libandroid-shmem libdrm libx11 libxfixes libxshmfence \
-            libxxf86vm libpixman libjpeg-turbo libxdamage libxinerama \
-            libxfont2 libxkbfile libpciaccess xcb-util-renderutil \
-            xcb-util-image xcb-util-keysyms xcb-util-wm xorg-xrandr \
-            xorg-xkbcomp xkeyboard-config xorg-font-util xorg-util-macros \
-            xorgproto zstd
-
-          for deb in "$APTROOT"/archives/*.deb; do
-            echo "Extracting $(basename "$deb")"
-            dpkg-deb -x "$deb" "$SYSROOT"
-          done
-
-          find "$SYSROOT" -maxdepth 6 -type d | head -n 40
-
       - name: Clone Mesa
         run: |
-          git clone --depth 1 --branch "mesa-${{ inputs.mesa_version }}" \
-            https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          set -eux
+          git clone --depth 1 \
+            --branch "mesa-${{ inputs.mesa_version }}" \
+            https://gitlab.freedesktop.org/mesa/mesa.git
 
-      - name: Write meson cross file
+      - name: Write Android aarch64 Meson cross file
         run: |
-          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          API=${{ inputs.api_level }}
-          SYSROOT_EXTRA="$PWD/sysroot/data/data/com.termux/files/usr"
+          set -eux
 
-          cat > cross.ini <<EOF
+          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          API="${{ inputs.api_level }}"
+
+          cat > android-aarch64.ini <<EOF
           [binaries]
-          c = '$NDK_BIN/aarch64-linux-android${API}-clang'
-          cpp = '$NDK_BIN/aarch64-linux-android${API}-clang++'
-          ar = '$NDK_BIN/llvm-ar'
-          strip = '$NDK_BIN/llvm-strip'
-          pkg-config = 'pkg-config'
+          c = '${NDK_BIN}/aarch64-linux-android${API}-clang'
+          cpp = '${NDK_BIN}/aarch64-linux-android${API}-clang++'
+          ar = '${NDK_BIN}/llvm-ar'
+          ranlib = '${NDK_BIN}/llvm-ranlib'
+          strip = '${NDK_BIN}/llvm-strip'
+          objcopy = '${NDK_BIN}/llvm-objcopy'
+          ld = '${NDK_BIN}/ld.lld'
+          pkg-config = ''
+
+          [host_machine]
+          system = 'android'
+          kernel = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
 
           [built-in options]
-          c_args = ['-I$SYSROOT_EXTRA/include']
-          cpp_args = ['-I$SYSROOT_EXTRA/include']
-          c_link_args = ['-L$SYSROOT_EXTRA/lib', '-Wl,-rpath-link,$SYSROOT_EXTRA/lib']
-          cpp_link_args = ['-L$SYSROOT
+          c_args = [
+            '-D__ANDROID_API__=${API}',
+            '-fPIC'
+          ]
+          cpp_args = [
+            '-D__ANDROID_API__=${API}',
+            '-fPIC'
+          ]
+          c_link_args = [
+            '-fuse-ld=lld',
+            '-Wl,--no-rosegment'
+          ]
+          cpp_link_args = [
+            '-fuse-ld=lld',
+            '-Wl,--no-rosegment'
+          ]
+          EOF
+
+      - name: Configure Mesa with Meson
+        env:
+          GALLIUM_DRIVERS: ${{ inputs.gallium_drivers }}
+          API_LEVEL: ${{ inputs.api_level }}
+        run: |
+          set -eux
+
+          meson setup build-android \
+            mesa \
+            --cross-file android-aarch64.ini \
+            --buildtype=release \
+            --prefix=/data/local/tmp/mesa \
+            --libdir=lib \
+            -Dplatforms=android \
+            -Dplatform-sdk-version="${API_LEVEL}" \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Dandroid-liblog=enabled \
+            -Degl=enabled \
+            -Dopengl=true \
+            -Dglx=disabled \
+            -Dllvm=disabled \
+            -Dshared-glapi=enabled \
+            -Dgallium-drivers="${GALLIUM_DRIVERS}" \
+            -Dvulkan-drivers= \
+            -Dgallium-va=disabled \
+            -Dgallium-xa=disabled \
+            -Dgallium-omx=disabled \
+            -Dgallium nine=false \
+            -Dbuild-tests=false \
+            -Dtools=
+
+      - name: Build Mesa
+        run: |
+          set -eux
+          meson compile -C build-android
+
+      - name: Install into staging directory
+        run: |
+          set -eux
+          DESTDIR="$PWD/stage" meson install -C build-android
+
+      - name: Package build
+        run: |
+          set -eux
+          tar -C stage -czf \
+            "mesa-${{ inputs.mesa_version }}-android-aarch64-zink.tar.gz" \
+            .
+
+      - name: Upload Mesa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-${{ inputs.mesa_version }}-android-aarch64-zink
+          path: mesa-${{ inputs.mesa_version }}-android-aarch64-zink.tar.gz
