@@ -1,0 +1,80 @@
+name: Build Mesa 25.2 Zink (bionic aarch64 / Mali G52 MC2)
+
+# Builds Mesa's zink Gallium driver against Termux's bionic toolchain by
+# piggybacking on termux-packages' own build system (which already has the
+# full bionic dependency chain — libdrm, libx11, llvm, wayland, etc. — solved).
+# Output is a raw zink_dri.so you can import into Bannerlator's Wrapper
+# Version Manager (or hand-pack into a .tzst yourself).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_version:
+        description: 'Exact Mesa release version to build (must exist at archive.mesa3d.org)'
+        required: false
+        default: '25.2.0'
+      gallium_drivers:
+        description: 'Comma-separated gallium drivers to build (keep it minimal for faster CI)'
+        required: false
+        default: 'zink,swrast'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout termux-packages
+        uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          fetch-depth: 1
+
+      - name: Pin mesa build.sh to requested version
+        run: |
+          set -e
+          MESA_VERSION="${{ inputs.mesa_version }}"
+          URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+
+          echo "Fetching ${URL} to compute checksum..."
+          curl -fL -o mesa.tar.xz "$URL"
+          SHA256=$(sha256sum mesa.tar.xz | cut -d' ' -f1)
+          echo "SHA256=${SHA256}"
+
+          BUILD_SH=packages/mesa/build.sh
+
+          sed -i "s/^TERMUX_PKG_VERSION=.*/TERMUX_PKG_VERSION=\"${MESA_VERSION}\"/" "$BUILD_SH"
+          sed -i "s/^TERMUX_PKG_REVISION=.*/TERMUX_PKG_REVISION=0/" "$BUILD_SH"
+          sed -i "s/^TERMUX_PKG_SHA256=.*/TERMUX_PKG_SHA256=${SHA256}/" "$BUILD_SH"
+
+          # Trim gallium-drivers to just what you actually want (faster build).
+          sed -i "s/-Dgallium-drivers=[^\"]*/-Dgallium-drivers=${{ inputs.gallium_drivers }}/" "$BUILD_SH"
+
+          echo "----- resulting header -----"
+          head -n 20 "$BUILD_SH"
+
+      - name: Build mesa for aarch64 via termux-packages Docker builder
+        run: |
+          ./scripts/run-docker.sh ./build-package.sh -a aarch64 -I mesa
+
+      - name: List build output
+        run: |
+          find . -maxdepth 2 -iname '*.deb' -exec ls -la {} \;
+
+      - name: Extract driver .so files
+        run: |
+          set -e
+          mkdir -p extracted out
+          DEB=$(find . -maxdepth 2 -iname 'mesa_*.deb' | head -n1)
+          if [ -z "$DEB" ]; then
+            echo "Could not find built mesa .deb — check the build step logs above."
+            exit 1
+          fi
+          echo "Extracting $DEB"
+          dpkg-deb -x "$DEB" extracted
+          find extracted -iname '*.so*' -path '*dri*' -exec cp -v {} out/ \;
+          ls -la out/
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-${{ inputs.mesa_version }}-zink-aarch64-bionic
+          path: out/
